@@ -6,7 +6,7 @@ def run(c):
     """
     Run the AI Document Backend service.
     """
-    c.run("docker-compose up -d --build")
+    c.run("docker-compose -f .\devops-config\docker-compose.local.yml up --build")
 
 
 @task
