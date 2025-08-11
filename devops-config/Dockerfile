@@ -14,8 +14,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
 
-COPY src/main.py .
+# Copy the src directory contents to /app (maintaining structure)
+COPY src/ .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3.11", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

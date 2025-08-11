@@ -1,116 +1,93 @@
 import asyncio
-import asyncpg
-from typing import Optional, Any, Dict, List, Union, Tuple
-import threading
 import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import asyncpg
 
 
 logger = logging.getLogger(__name__)
 
-class DatabaseClient:
+class DatabaseManager:
     """
-    Singleton PostgreSQL database client for CRUD operations.
-    
-    Provides async connectivity and operations using SQL statements.
+    Factory-based database manager with async context management.
+    Simpler and more predictable than singleton pattern.
     """
     
-    _instance: Optional['DatabaseClient'] = None
-    _lock = threading.Lock()
-    _initialized = False
+    # _pool: Optional[asyncpg.Pool] = None
+    _lock: Optional[asyncio.Lock] = None
+    _db_url: Optional[str] = None
+    _initialized: bool = False
     
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super(DatabaseClient, cls).__new__(cls)
-        return cls._instance
+    @classmethod
+    def _ensure_lock(cls):
+        """Ensure asyncio lock is created in correct event loop context."""
+        if cls._lock is None:
+            try:
+                cls._lock = asyncio.Lock()
+            except RuntimeError:
+                # No event loop running - will be created when needed
+                pass
     
-    def __init__(self, db_url: str):
-        if self._initialized:
-            return
-            
-        self.db_url = db_url
-        self.client: Optional[asyncpg.Pool] = None
-        self._connection_lock = asyncio.Lock()
-        self._initialized = True
-        logger.info("PostgreSQL DatabaseClient singleton initialized")
-
-    async def connect(self, min_size: int = 10, max_size: int = 20, command_timeout: int = 60, **kwargs):
-        """
-        Establish connection pool to PostgreSQL database.
+    @classmethod
+    async def initialize(cls, db_url: str, min_size: int = 10, max_size: int = 20, 
+                        command_timeout: int = 60, **kwargs):
+        """Initialize the database pool."""
+        cls._ensure_lock()
         
-        Args:
-            min_size: Minimum number of connections in the pool
-            max_size: Maximum number of connections in the pool
-            command_timeout: Command timeout in seconds
-            **kwargs: Additional connection parameters
-        """
-        async with self._connection_lock:
-            if self.client is not None:
-                logger.warning("Database client is already connected")
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+        
+        async with cls._lock:
+            if cls._pool is not None:
+                logger.warning("Database already initialized")
                 return
             
             try:
-                self.client = await asyncpg.create_pool(
-                    self.db_url,
+                cls._db_url = db_url
+                cls._pool = await asyncpg.create_pool(
+                    db_url,
                     min_size=min_size,
                     max_size=max_size,
                     command_timeout=command_timeout,
                     server_settings=kwargs.get('server_settings', {'jit': 'off'}),
                     **{k: v for k, v in kwargs.items() if k != 'server_settings'}
                 )
-                logger.info(f"Connected to PostgreSQL database with pool size {min_size}-{max_size}")
+                cls._initialized = True
+                logger.info(f"Database pool initialized with size {min_size}-{max_size}")
                 
-                # Test the connection
-                await self.execute_query("SELECT 1", fetch="val")
+                # Test connection
+                async with cls._pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
                 logger.info("Database connection test successful")
-                    
+                
             except Exception as e:
-                logger.error(f"Failed to connect to database: {e}") 
-                self.client = None
+                logger.error(f"Failed to initialize database pool: {e}")
+                cls._pool = None
+                cls._initialized = False
                 raise
     
-    async def disconnect(self):
-        """Close all connections in the pool and cleanup resources."""
-        async with self._connection_lock:
-            if self.client is None:
-                logger.warning("Database client is not connected")
-                return
+    @classmethod
+    async def close(cls):
+        """Close the database pool."""
+        if cls._lock is None:
+            return
             
-            try:
-                await self.client.close()
-                self.client = None
-                logger.info("Disconnected from PostgreSQL database")
-            except Exception as e:
-                logger.error(f"Error during disconnect: {e}")
-                raise
+        async with cls._lock:
+            if cls._pool is not None:
+                await cls._pool.close()
+                cls._pool = None
+                cls._initialized = False
+                logger.info("Database pool closed")
     
-    async def execute_query(
-        self, 
-        query: str, 
-        params: tuple = (), 
-        fetch: str = "all"
-    ) -> Union[List[Dict[str, Any]], Dict[str, Any], Any, None]:
-        """
-        Execute a SQL query for CRUD operations.
-        
-        Args:
-            query: SQL query string
-            params: Query parameters as tuple
-            fetch: Type of fetch operation ('all', 'one', 'val', 'none')
-                  - 'all': fetchall() - returns list of records
-                  - 'one': fetchrow() - returns single record or None
-                  - 'val': fetchval() - returns single value or None
-                  - 'none': execute() - returns execution result
-        
-        Returns:
-            Query results based on fetch type
-        """
-        if self.client is None:
-            raise RuntimeError("Database client is not connected. Call connect() first.")
+    @classmethod
+    async def execute_query(cls, query: str, params: tuple = (), 
+                          fetch: str = "all") -> Union[List[Dict[str, Any]], Dict[str, Any], Any, None]:
+        """Execute a query using the shared pool."""
+        if not cls.is_initialized():
+            raise RuntimeError("Database not initialized. Call initialize() first.")
         
         try:
-            async with self.client.acquire() as conn:
+            async with cls._pool.acquire() as conn:
                 if fetch == "all":
                     result = await conn.fetch(query, *params)
                     return [dict(record) for record in result]
@@ -123,30 +100,22 @@ class DatabaseClient:
                     return await conn.execute(query, *params)
                 else:
                     raise ValueError(f"Invalid fetch type: {fetch}")
-            
+        
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
             logger.error(f"Query: {query}")
             logger.error(f"Params: {params}")
             raise
     
-    async def execute_transaction(self, queries: List[Tuple[str, tuple, str]]) -> List[Any]:
-        """
-        Execute multiple CRUD operations in a single transaction.
-        
-        Args:
-            queries: List of tuples (query, params, fetch_type)
-                    Example: [("INSERT INTO users (name) VALUES ($1)", ("John",), "none")]
-        
-        Returns:
-            List of results for each query
-        """
-        if self.client is None:
-            raise RuntimeError("Database client is not connected. Call connect() first.")
+    @classmethod
+    async def execute_transaction(cls, queries: List[Tuple[str, tuple, str]]) -> List[Any]:
+        """Execute multiple operations in a single transaction."""
+        if not cls.is_initialized():
+            raise RuntimeError("Database not initialized. Call initialize() first.")
         
         try:
             results = []
-            async with self.client.acquire() as conn:
+            async with cls._pool.acquire() as conn:
                 async with conn.transaction():
                     for query, params, fetch_type in queries:
                         if fetch_type == "all":
@@ -169,48 +138,74 @@ class DatabaseClient:
             logger.error(f"Transaction failed: {e}")
             raise
     
-    async def get_connection(self):
-        """
-        Get a connection from the pool for advanced operations.
-        Use with async context manager.
-        
-        Example:
-            async with db.get_connection() as conn:
-                result = await conn.fetch("SELECT * FROM users")
-        
-        Returns:
-            Connection context manager
-        """
-        if self.client is None:
-            raise RuntimeError("Database client is not connected.")
-        
-        return self.client.acquire()
+    @classmethod
+    def get_connection(cls):
+        """Get a connection from the pool for advanced operations."""
+        if not cls.is_initialized():
+            raise RuntimeError("Database not initialized.")
+        return cls._pool.acquire()
     
-    @property
-    def is_connected(self) -> bool:
-        """Check if the database client is connected."""
-        return self.client is not None and not self.client._closed
+    @classmethod
+    def is_initialized(cls) -> bool:
+        """Check if the database manager is initialized."""
+        return cls._initialized and cls._pool is not None and not cls._pool._closed
     
-    async def health_check(self) -> bool:
-        """
-        Perform a health check on the database connection.
-        
-        Returns:
-            True if database is accessible, False otherwise
-        """
+    @classmethod
+    async def health_check(cls) -> bool:
+        """Perform a health check on the database connection."""
         try:
-            result = await self.execute_query("SELECT 1", fetch="val")
+            if not cls.is_initialized():
+                return False
+            result = await cls.execute_query("SELECT 1", fetch="val")
             return result == 1
         except Exception as e:
             logger.error(f"Health check failed: {e}")
             return False
     
+    # Context manager support for the class itself
+    @classmethod
+    async def __aenter__(cls):
+        """Class-level async context manager entry."""
+        # Assumes initialize() was called before entering context
+        if not cls.is_initialized():
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        return cls
+    
+    @classmethod
+    async def __aexit__(cls, exc_type, exc_val, exc_tb):
+        """Class-level async context manager exit."""
+        await cls.close()
+
+
+class DatabaseContext:
+    """
+    Instance-based context manager for DatabaseManager.
+    Provides more intuitive context management.
+    """
+    
+    def __init__(self, db_url: str, min_size: int = 10, max_size: int = 20, 
+                 command_timeout: int = 60, **kwargs):
+        self.db_url = db_url
+        self.min_size = min_size
+        self.max_size = max_size
+        self.command_timeout = command_timeout
+        self.kwargs = kwargs
+        self._should_close = False
+    
     async def __aenter__(self):
-        """Async context manager entry."""
-        if not self.is_connected:
-            await self.connect()
-        return self
+        """Initialize database if not already done."""
+        if not DatabaseManager.is_initialized():
+            await DatabaseManager.initialize(
+                self.db_url, 
+                self.min_size, 
+                self.max_size, 
+                self.command_timeout, 
+                **self.kwargs
+            )
+            self._should_close = True
+        return DatabaseManager
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.disconnect()
+        """Close database only if we initialized it."""
+        if self._should_close:
+            await DatabaseManager.close()
