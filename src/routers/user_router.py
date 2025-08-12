@@ -19,12 +19,7 @@ async def login(
     It verifies the user's credentials and returns a success message if valid.
     """    
     logging.info(f"Attempting to log in user: {login_data.username}")
-    user = await user_service.verify_user(login_data.username, login_data.hashed_password)
-    
-    if user:
-        return {"message": "Login successful", "user": user}
-    else:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return await user_service.verify_user(login_data)
 
 
 @router.post("/register")

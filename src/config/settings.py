@@ -22,3 +22,13 @@ POSTGRESQL_CONNECTION_STRING = DB_CONNECTION_STRING.format(
     pswd=DB_PASSWORD,
     db_name=APP_DATABASE_NAME
 )
+
+JWT_SECRET_KEY_FILE = os.getenv("JWT_SECRET_KEY", "/app/src/secrets/jwt.key")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_SECRET_KEY = None
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", 60))
+
+with open(JWT_SECRET_KEY_FILE, "rb") as f:
+    JWT_SECRET_KEY = f.read().strip()
+
+PASSWORD_SALT_ROUNDS = int(os.getenv("PASSWORD_SALT_ROUNDS", 12))
